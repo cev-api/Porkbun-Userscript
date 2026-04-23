@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Porkbun - Hide sold/unavailable/error results
 // @namespace    https://tampermonkey.net/
-// @version      1.6
-// @description  Hides unavailable, sold, error, inquire-only, compound TLD, and aftermarket results on Porkbun search pages, with TLD length filtering.
+// @version      3.0
+// @description  Filters Porkbun results, supports TLD filters, inline renewal prices, displayed currency conversion, and auto-expands all extensions.
 // @author       CevAPI
 // @match        https://porkbun.com/checkout/search*
 // @match        https://www.porkbun.com/checkout/search*
@@ -24,19 +24,66 @@
     const TOGGLE_BUTTON_ID = 'pb-tld-filter-toggle';
     const COMPOUND_TLD_CHECKBOX_ID = 'pb-hide-compound-tlds';
     const AFTERMARKET_CHECKBOX_ID = 'pb-hide-aftermarket';
+    const INLINE_PRICES_CHECKBOX_ID = 'pb-inline-renewal-prices';
+    const CONVERT_PRICES_CHECKBOX_ID = 'pb-convert-visible-prices';
+    const TARGET_CURRENCY_SELECT_ID = 'pb-target-currency';
+    const FX_STATUS_ID = 'pb-fx-status';
     const BODY_ID = 'pb-tld-filter-body';
+
     const STORAGE_MIN_KEY = 'pb_tld_filter_min';
     const STORAGE_MAX_KEY = 'pb_tld_filter_max';
     const STORAGE_COLLAPSED_KEY = 'pb_tld_filter_collapsed';
     const STORAGE_HIDE_COMPOUND_TLDS_KEY = 'pb_hide_compound_tlds';
     const STORAGE_HIDE_AFTERMARKET_KEY = 'pb_hide_aftermarket';
+    const STORAGE_INLINE_RENEWAL_PRICES_KEY = 'pb_inline_renewal_prices';
+    const STORAGE_CONVERT_VISIBLE_PRICES_KEY = 'pb_convert_visible_prices';
+    const STORAGE_TARGET_CURRENCY_KEY = 'pb_target_currency';
+
+    const PRICE_SNAPSHOT_ATTR = 'data-pb-price-snapshot';
+    const FX_CACHE_PREFIX = 'pb_fx_rate_';
+    const FX_CACHE_TTL_MS = 1000 * 60 * 60 * 12;
+
+    const SUPPORTED_CURRENCIES = [
+        'USD',
+        'AUD',
+        'CAD',
+        'CHF',
+        'CNY',
+        'DKK',
+        'EUR',
+        'GBP',
+        'HKD',
+        'JPY',
+        'NOK',
+        'NZD',
+        'SEK',
+        'SGD'
+    ];
+
+    const CURRENCY_SYMBOLS = {
+        USD: '$',
+        AUD: 'A$',
+        CAD: 'C$',
+        CHF: 'CHF ',
+        CNY: '¥',
+        DKK: 'kr ',
+        EUR: '€',
+        GBP: '£',
+        HKD: 'HK$',
+        JPY: '¥',
+        NOK: 'kr ',
+        NZD: 'NZ$',
+        SEK: 'kr ',
+        SGD: 'S$'
+    };
+
+    let refreshTimer = null;
+    let refreshRunning = false;
+    let fxRequestToken = 0;
 
     function normalizeText(text)
     {
-        return (text || '')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .toLowerCase();
+        return (text || '').replace(/\s+/g, ' ').trim().toLowerCase();
     }
 
     function injectStyle()
@@ -55,7 +102,7 @@
                 top: 16px;
                 right: 16px;
                 z-index: 999999;
-                width: 260px;
+                width: 290px;
                 background: rgba(255, 255, 255, 0.98);
                 border: 1px solid #d9d9d9;
                 border-radius: 8px;
@@ -101,13 +148,15 @@
                 color: #555;
             }
 
-            #${UI_ID} input[type="number"] {
+            #${UI_ID} input[type="number"],
+            #${UI_ID} select {
                 width: 100%;
                 padding: 6px 8px;
                 border: 1px solid #cfcfcf;
                 border-radius: 4px;
                 font-size: 13px;
                 line-height: 1.2;
+                background: #fff;
             }
 
             #${UI_ID} .pb-tld-filter-actions {
@@ -155,6 +204,56 @@
                 margin: 0;
                 cursor: pointer;
             }
+
+            #${UI_ID} .pb-divider {
+                margin: 12px 0;
+                border-top: 1px solid #ececec;
+            }
+
+            #${UI_ID} .pb-section-title {
+                font-size: 12px;
+                font-weight: 700;
+                color: #444;
+                margin: 0 0 8px 0;
+            }
+
+            #${UI_ID} #${FX_STATUS_ID} {
+                margin-top: 8px;
+                font-size: 12px;
+                color: #555;
+                line-height: 1.35;
+                min-height: 16px;
+            }
+
+            .pb-price-render {
+                line-height: 1.25;
+            }
+
+            .pb-price-render strong {
+                font-weight: 700;
+            }
+
+            .pb-price-render-badge {
+                display: inline-block;
+                margin-bottom: 4px;
+                padding: 2px 6px;
+                border-radius: 3px;
+                background: #555;
+                color: #fff;
+                font-size: 11px;
+                font-weight: 700;
+            }
+
+            .pb-price-render-subtle {
+                color: #666;
+                font-size: 12px;
+            }
+
+            .pb-price-render-note {
+                color: #666;
+                font-size: 12px;
+                margin-top: 2px;
+            }
         `;
         document.head.appendChild(style);
     }
@@ -174,10 +273,26 @@
         return Array.from(document.querySelectorAll('.sideBarSearchResults'));
     }
 
+    function getPriceContainers()
+    {
+        return Array.from(document.querySelectorAll('[id^="searchResultRowPrice_"]'));
+    }
+
+    function extractMoneyStrings(text)
+    {
+        return String(text || '').match(/\$[\d,]+(?:\.\d{2})?/g) || [];
+    }
+
+    function parseMoneyString(value)
+    {
+        const parsed = parseFloat(String(value || '').replace(/\$/g, '').replace(/,/g, ''));
+        return Number.isNaN(parsed) ? null : parsed;
+    }
+
     function hasPriceText(element)
     {
         const raw = element ? (element.innerText || element.textContent || '') : '';
-        return /\$\s?\d/.test(raw);
+        return /\$[\d,]+(?:\.\d{2})?/.test(raw);
     }
 
     function hasAddToCartControl(element)
@@ -257,6 +372,23 @@
         return parsed;
     }
 
+    function getStoredString(key, fallback)
+    {
+        const value = localStorage.getItem(key);
+        if(value === null || value === '') return fallback;
+        return value;
+    }
+
+    function getStoredBoolean(key)
+    {
+        return localStorage.getItem(key) === '1';
+    }
+
+    function setStoredBoolean(key, value)
+    {
+        localStorage.setItem(key, value ? '1' : '0');
+    }
+
     function getLengthFilterState()
     {
         return {
@@ -288,32 +420,63 @@
 
     function getCollapsedState()
     {
-        return localStorage.getItem(STORAGE_COLLAPSED_KEY) === '1';
+        return getStoredBoolean(STORAGE_COLLAPSED_KEY);
     }
 
     function saveCollapsedState(collapsed)
     {
-        localStorage.setItem(STORAGE_COLLAPSED_KEY, collapsed ? '1' : '0');
+        setStoredBoolean(STORAGE_COLLAPSED_KEY, collapsed);
     }
 
     function getHideCompoundTldsState()
     {
-        return localStorage.getItem(STORAGE_HIDE_COMPOUND_TLDS_KEY) === '1';
+        return getStoredBoolean(STORAGE_HIDE_COMPOUND_TLDS_KEY);
     }
 
     function saveHideCompoundTldsState(enabled)
     {
-        localStorage.setItem(STORAGE_HIDE_COMPOUND_TLDS_KEY, enabled ? '1' : '0');
+        setStoredBoolean(STORAGE_HIDE_COMPOUND_TLDS_KEY, enabled);
     }
 
     function getHideAftermarketState()
     {
-        return localStorage.getItem(STORAGE_HIDE_AFTERMARKET_KEY) === '1';
+        return getStoredBoolean(STORAGE_HIDE_AFTERMARKET_KEY);
     }
 
     function saveHideAftermarketState(enabled)
     {
-        localStorage.setItem(STORAGE_HIDE_AFTERMARKET_KEY, enabled ? '1' : '0');
+        setStoredBoolean(STORAGE_HIDE_AFTERMARKET_KEY, enabled);
+    }
+
+    function getInlineRenewalPricesState()
+    {
+        return getStoredBoolean(STORAGE_INLINE_RENEWAL_PRICES_KEY);
+    }
+
+    function saveInlineRenewalPricesState(enabled)
+    {
+        setStoredBoolean(STORAGE_INLINE_RENEWAL_PRICES_KEY, enabled);
+    }
+
+    function getConvertVisiblePricesState()
+    {
+        return getStoredBoolean(STORAGE_CONVERT_VISIBLE_PRICES_KEY);
+    }
+
+    function saveConvertVisiblePricesState(enabled)
+    {
+        setStoredBoolean(STORAGE_CONVERT_VISIBLE_PRICES_KEY, enabled);
+    }
+
+    function getTargetCurrencyState()
+    {
+        const value = getStoredString(STORAGE_TARGET_CURRENCY_KEY, 'EUR');
+        return SUPPORTED_CURRENCIES.includes(value) ? value : 'EUR';
+    }
+
+    function saveTargetCurrencyState(value)
+    {
+        localStorage.setItem(STORAGE_TARGET_CURRENCY_KEY, value);
     }
 
     function parseInputValue(value)
@@ -405,6 +568,225 @@
         if(element) element.classList.remove(HIDE_CLASS);
     }
 
+    function getCurrencySymbol(code)
+    {
+        return CURRENCY_SYMBOLS[code] || (code + ' ');
+    }
+
+    function formatMoney(value, currencyCode)
+    {
+        const symbol = getCurrencySymbol(currencyCode);
+        return symbol + value.toFixed(2);
+    }
+
+    function extractPriceModel(container)
+    {
+        if(!container) return null;
+
+        const text = container.innerText || container.textContent || '';
+        const normalized = normalizeText(text);
+        const moneyStrings = extractMoneyStrings(text);
+        const moneyValues = moneyStrings
+            .map(parseMoneyString)
+            .filter(value => value !== null);
+
+        const renewalNode = container.querySelector('.renewsAtContainer');
+        let renewalValue = null;
+
+        if(renewalNode)
+        {
+            const renewalMoneyStrings = extractMoneyStrings(renewalNode.textContent || '');
+            if(renewalMoneyStrings.length > 0)
+            {
+                renewalValue = parseMoneyString(renewalMoneyStrings[renewalMoneyStrings.length - 1]);
+            }
+        }
+
+        const isAftermarket = hasAftermarketBadge(container) || normalized.includes('transfer fee');
+        const hasPerYear = normalized.includes('/ year');
+        const hasTransferFee = normalized.includes('transfer fee');
+        const isPremium = normalized.includes('premium');
+
+        if(isAftermarket)
+        {
+            if(moneyValues.length === 0) return null;
+
+            return {
+                kind: 'aftermarket',
+                current: moneyValues[0],
+                renewal: null,
+                perYear: false,
+                premium: false,
+                transferFee: hasTransferFee
+            };
+        }
+
+        if(moneyValues.length === 0) return null;
+
+        let currentValue = moneyValues[moneyValues.length - 1];
+
+        if(renewalValue !== null)
+        {
+            currentValue = moneyValues[moneyValues.length - 1];
+
+            for(let i = moneyValues.length - 1; i >= 0; i--)
+            {
+                if(Math.abs(moneyValues[i] - renewalValue) > 0.000001)
+                {
+                    currentValue = moneyValues[i];
+                    break;
+                }
+            }
+        }
+
+        return {
+            kind: 'standard',
+            current: currentValue,
+            renewal: renewalValue,
+            perYear: hasPerYear,
+            premium: isPremium,
+            transferFee: false
+        };
+    }
+
+    function captureBasePriceHtml()
+    {
+        getPriceContainers().forEach(container =>
+        {
+            if(container.getAttribute(PRICE_SNAPSHOT_ATTR) === '1') return;
+
+            const model = extractPriceModel(container);
+            if(!model) return;
+
+            container.dataset.pbBaseHtml = container.innerHTML;
+            container.setAttribute(PRICE_SNAPSHOT_ATTR, '1');
+        });
+    }
+
+    function restoreBasePriceHtml()
+    {
+        getPriceContainers().forEach(container =>
+        {
+            if(container.dataset.pbBaseHtml === undefined) return;
+            container.innerHTML = container.dataset.pbBaseHtml;
+        });
+    }
+
+    function buildRenderedPriceHtml(model, currencyCode, rate, inlinePricesEnabled)
+    {
+        const currentValue = model.current * rate;
+        const renewalValue = model.renewal !== null ? model.renewal * rate : null;
+        const currentText = formatMoney(currentValue, currencyCode);
+        const renewalText = renewalValue !== null ? formatMoney(renewalValue, currencyCode) : null;
+
+        if(model.kind === 'aftermarket')
+        {
+            return `
+                <div class="pb-price-render">
+                    <div class="pb-price-render-badge">Aftermarket</div>
+                    <div>${currentText}</div>
+                    ${model.transferFee ? '<div class="pb-price-render-note">+ transfer fee</div>' : ''}
+                </div>
+            `;
+        }
+
+        if(inlinePricesEnabled && renewalText !== null)
+        {
+            return `
+                <div class="pb-price-render">
+                    ${currentText} | <strong>${renewalText}</strong> Renewal
+                </div>
+            `;
+        }
+
+        if(renewalText !== null)
+        {
+            return `
+                <div class="pb-price-render">
+                    <div>${currentText}${model.perYear ? ' / year' : ''}</div>
+                    <div class="pb-price-render-note"><strong>${renewalText}</strong> Renewal</div>
+                    ${model.premium ? '<div class="pb-price-render-subtle">Premium</div>' : ''}
+                </div>
+            `;
+        }
+
+        return `
+            <div class="pb-price-render">
+                <div>${currentText}${model.perYear ? ' / year' : ''}</div>
+                ${model.premium ? '<div class="pb-price-render-subtle">Premium</div>' : ''}
+            </div>
+        `;
+    }
+
+    function getCachedFxRate(targetCurrency)
+    {
+        try
+        {
+            const raw = localStorage.getItem(FX_CACHE_PREFIX + targetCurrency);
+            if(!raw) return null;
+
+            const parsed = JSON.parse(raw);
+            if(!parsed || typeof parsed.rate !== 'number' || typeof parsed.timestamp !== 'number') return null;
+            if(Date.now() - parsed.timestamp > FX_CACHE_TTL_MS) return null;
+
+            return parsed.rate;
+        }
+        catch(error)
+        {
+            return null;
+        }
+    }
+
+    function setCachedFxRate(targetCurrency, rate)
+    {
+        try
+        {
+            localStorage.setItem(FX_CACHE_PREFIX + targetCurrency, JSON.stringify({
+                rate: rate,
+                timestamp: Date.now()
+            }));
+        }
+        catch(error)
+        {
+        }
+    }
+
+    async function fetchFxRate(targetCurrency)
+    {
+        if(targetCurrency === 'USD') return 1;
+
+        const cached = getCachedFxRate(targetCurrency);
+        if(cached !== null) return cached;
+
+        const response = await fetch(`https://api.frankfurter.dev/v2/rates?base=USD&quotes=${encodeURIComponent(targetCurrency)}`, {
+            method: 'GET',
+            credentials: 'omit',
+            cache: 'no-store'
+        });
+
+        if(!response.ok)
+        {
+            throw new Error('HTTP ' + response.status);
+        }
+
+        const data = await response.json();
+        if(!data || !data.rates || typeof data.rates[targetCurrency] !== 'number')
+        {
+            throw new Error('No rate');
+        }
+
+        const rate = data.rates[targetCurrency];
+        setCachedFxRate(targetCurrency, rate);
+        return rate;
+    }
+
+    function buildCurrencyOptions()
+    {
+        return SUPPORTED_CURRENCIES.map(code =>
+            `<option value="${code}">${code}</option>`
+        ).join('');
+    }
+
     function ensureOverlay()
     {
         if(document.getElementById(UI_ID)) return;
@@ -413,7 +795,7 @@
         overlay.id = UI_ID;
         overlay.innerHTML = `
             <div class="pb-tld-filter-header">
-                <span>TLD length filter</span>
+                <span>TLD filters</span>
                 <button id="${TOGGLE_BUTTON_ID}" type="button">Hide</button>
             </div>
             <div id="${BODY_ID}" class="pb-tld-filter-body">
@@ -438,6 +820,25 @@
                     <input id="${AFTERMARKET_CHECKBOX_ID}" type="checkbox">
                     <label for="${AFTERMARKET_CHECKBOX_ID}">Hide aftermarket results</label>
                 </div>
+                <div class="pb-tld-filter-checkbox">
+                    <input id="${INLINE_PRICES_CHECKBOX_ID}" type="checkbox">
+                    <label for="${INLINE_PRICES_CHECKBOX_ID}">Inline renewal prices</label>
+                </div>
+                <div class="pb-divider"></div>
+                <div class="pb-section-title">Displayed currency</div>
+                <div class="pb-tld-filter-checkbox">
+                    <input id="${CONVERT_PRICES_CHECKBOX_ID}" type="checkbox">
+                    <label for="${CONVERT_PRICES_CHECKBOX_ID}">Convert visible prices</label>
+                </div>
+                <div class="pb-tld-filter-row" style="margin-top:10px;">
+                    <div class="pb-tld-filter-field">
+                        <label for="${TARGET_CURRENCY_SELECT_ID}">Currency</label>
+                        <select id="${TARGET_CURRENCY_SELECT_ID}">
+                            ${buildCurrencyOptions()}
+                        </select>
+                    </div>
+                </div>
+                <div id="${FX_STATUS_ID}"></div>
             </div>
         `;
 
@@ -449,12 +850,18 @@
         const toggleButton = document.getElementById(TOGGLE_BUTTON_ID);
         const compoundCheckbox = document.getElementById(COMPOUND_TLD_CHECKBOX_ID);
         const aftermarketCheckbox = document.getElementById(AFTERMARKET_CHECKBOX_ID);
+        const inlinePricesCheckbox = document.getElementById(INLINE_PRICES_CHECKBOX_ID);
+        const convertPricesCheckbox = document.getElementById(CONVERT_PRICES_CHECKBOX_ID);
+        const targetCurrencySelect = document.getElementById(TARGET_CURRENCY_SELECT_ID);
 
         const state = getLengthFilterState();
         minInput.value = state.min === '' ? '' : state.min;
         maxInput.value = state.max === '' ? '' : state.max;
         compoundCheckbox.checked = getHideCompoundTldsState();
         aftermarketCheckbox.checked = getHideAftermarketState();
+        inlinePricesCheckbox.checked = getInlineRenewalPricesState();
+        convertPricesCheckbox.checked = getConvertVisiblePricesState();
+        targetCurrencySelect.value = getTargetCurrencyState();
 
         if(getCollapsedState())
         {
@@ -467,7 +874,7 @@
             const min = parseInputValue(minInput.value);
             const max = parseInputValue(maxInput.value);
             saveLengthFilterState(min, max);
-            filterAll();
+            scheduleRefresh();
         });
 
         maxInput.addEventListener('input', () =>
@@ -475,7 +882,7 @@
             const min = parseInputValue(minInput.value);
             const max = parseInputValue(maxInput.value);
             saveLengthFilterState(min, max);
-            filterAll();
+            scheduleRefresh();
         });
 
         resetButton.addEventListener('click', () =>
@@ -487,19 +894,37 @@
             saveLengthFilterState('', '');
             saveHideCompoundTldsState(false);
             saveHideAftermarketState(false);
-            filterAll();
+            scheduleRefresh();
         });
 
         compoundCheckbox.addEventListener('change', () =>
         {
             saveHideCompoundTldsState(compoundCheckbox.checked);
-            filterAll();
+            scheduleRefresh();
         });
 
         aftermarketCheckbox.addEventListener('change', () =>
         {
             saveHideAftermarketState(aftermarketCheckbox.checked);
-            filterAll();
+            scheduleRefresh();
+        });
+
+        inlinePricesCheckbox.addEventListener('change', () =>
+        {
+            saveInlineRenewalPricesState(inlinePricesCheckbox.checked);
+            scheduleRefresh();
+        });
+
+        convertPricesCheckbox.addEventListener('change', () =>
+        {
+            saveConvertVisiblePricesState(convertPricesCheckbox.checked);
+            scheduleRefresh();
+        });
+
+        targetCurrencySelect.addEventListener('change', () =>
+        {
+            saveTargetCurrencyState(targetCurrencySelect.value);
+            scheduleRefresh();
         });
 
         toggleButton.addEventListener('click', () =>
@@ -604,19 +1029,194 @@
         });
     }
 
-    function filterAll()
+    function autoExpandAllExtensions()
     {
-        filterMainRows();
-        filterSidebarCards();
-        cleanupExplicitEmptyRows();
+        const candidates = Array.from(document.querySelectorAll('button, a'));
+
+        for(const el of candidates)
+        {
+            const text = normalizeText(el.textContent || '');
+            if(text.includes('show all extensions'))
+            {
+                if(el.dataset.pbAutoClicked !== '1')
+                {
+                    el.dataset.pbAutoClicked = '1';
+                    el.click();
+                }
+                return;
+            }
+        }
+    }
+
+    function setFxStatus(text)
+    {
+        const el = document.getElementById(FX_STATUS_ID);
+        if(el) el.textContent = text;
+    }
+
+    async function getConversionRate()
+    {
+        if(!getConvertVisiblePricesState())
+        {
+            setFxStatus('');
+            return {
+                currency: 'USD',
+                rate: 1
+            };
+        }
+
+        const requestToken = ++fxRequestToken;
+        const targetCurrency = getTargetCurrencyState();
+        setFxStatus('Loading ' + targetCurrency + ' rate...');
+
+        if(targetCurrency === 'USD')
+        {
+            if(requestToken === fxRequestToken)
+            {
+                setFxStatus('Showing USD prices');
+            }
+
+            return {
+                currency: 'USD',
+                rate: 1
+            };
+        }
+
+        try
+        {
+            const cached = getCachedFxRate(targetCurrency);
+            if(cached !== null)
+            {
+                if(requestToken === fxRequestToken)
+                {
+                    setFxStatus('Showing ' + targetCurrency + ' prices');
+                }
+
+                return {
+                    currency: targetCurrency,
+                    rate: cached
+                };
+            }
+
+            const response = await fetch(`https://api.frankfurter.dev/v2/rates?base=USD&quotes=${encodeURIComponent(targetCurrency)}`, {
+                method: 'GET',
+                credentials: 'omit',
+                cache: 'no-store'
+            });
+
+            if(!response.ok)
+            {
+                throw new Error('HTTP ' + response.status);
+            }
+
+            const data = await response.json();
+            if(!data || !data.rates || typeof data.rates[targetCurrency] !== 'number')
+            {
+                throw new Error('No rate');
+            }
+
+            const rate = data.rates[targetCurrency];
+            setCachedFxRate(targetCurrency, rate);
+
+            if(requestToken === fxRequestToken)
+            {
+                setFxStatus('Showing ' + targetCurrency + ' prices');
+            }
+
+            return {
+                currency: targetCurrency,
+                rate: rate
+            };
+        }
+        catch(error)
+        {
+            if(requestToken === fxRequestToken)
+            {
+                setFxStatus('Conversion failed');
+            }
+
+            return {
+                currency: 'USD',
+                rate: 1
+            };
+        }
+    }
+
+    async function rebuildPrices()
+    {
+        captureBasePriceHtml();
+        restoreBasePriceHtml();
+
+        const inlinePricesEnabled = getInlineRenewalPricesState();
+        const convertPricesEnabled = getConvertVisiblePricesState();
+
+        if(!inlinePricesEnabled && !convertPricesEnabled)
+        {
+            setFxStatus('');
+            return;
+        }
+
+        const conversion = await getConversionRate();
+
+        getPriceContainers().forEach(container =>
+        {
+            if(container.dataset.pbBaseHtml === undefined) return;
+
+            const model = extractPriceModel(container);
+            if(!model) return;
+
+            container.innerHTML = buildRenderedPriceHtml(
+                model,
+                conversion.currency,
+                conversion.rate,
+                inlinePricesEnabled
+            );
+        });
+    }
+
+    function refreshNow()
+    {
+        if(refreshRunning) return;
+
+        refreshRunning = true;
+
+        Promise.resolve().then(async () =>
+        {
+            try
+            {
+                ensureOverlay();
+                autoExpandAllExtensions();
+                filterMainRows();
+                filterSidebarCards();
+                cleanupExplicitEmptyRows();
+                await rebuildPrices();
+            }
+            finally
+            {
+                refreshRunning = false;
+            }
+        });
+    }
+
+    function scheduleRefresh()
+    {
+        if(refreshTimer !== null)
+        {
+            clearTimeout(refreshTimer);
+        }
+
+        refreshTimer = setTimeout(() =>
+        {
+            refreshTimer = null;
+            refreshNow();
+        }, 150);
     }
 
     function observe()
     {
         const observer = new MutationObserver(() =>
         {
-            ensureOverlay();
-            filterAll();
+            scheduleRefresh();
         });
 
         observer.observe(document.body, {
@@ -628,27 +1228,23 @@
     function init()
     {
         injectStyle();
-        ensureOverlay();
-        filterAll();
+        refreshNow();
         observe();
 
         window.addEventListener('load', () =>
         {
-            ensureOverlay();
-            filterAll();
+            scheduleRefresh();
         });
 
         window.addEventListener('pageshow', () =>
         {
-            ensureOverlay();
-            filterAll();
+            scheduleRefresh();
         });
 
         setInterval(() =>
         {
-            ensureOverlay();
-            filterAll();
-        }, 1000);
+            scheduleRefresh();
+        }, 2500);
     }
 
     init();
